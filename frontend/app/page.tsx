@@ -32,6 +32,32 @@ type Message = {
   streaming?: boolean;
 };
 
+type HistoryEntry = {
+  id: string;
+  question: string;
+  answer: string;
+  timestamp: number;
+};
+
+// One entry per uploaded document. Everything scoped to a single document
+// (its chat thread, its analysis, its history, its editable draft) lives
+// here so the app can hold several documents open at once and switch
+// between them — each one still just talks to the existing single-document
+// /api/upload, /api/analyze and /api/chat endpoints under the hood.
+type DocumentEntry = {
+  id: string;
+  file: File;
+  filename: string;
+  url: string;
+  analysis: Analysis | null;
+  analyzing: boolean;
+  thinking: boolean;
+  messages: Message[];
+  history: HistoryEntry[];
+  editText: string;
+  editIsOriginal: boolean; // true = editText holds the real file content (.txt)
+};
+
 type Theme = "dark" | "light";
 
 type ActionKind = "focus" | "send" | "prefill" | "history" | "soon";
@@ -44,16 +70,10 @@ type ActionItem = {
   prompt?: string;
 };
 
-type HistoryEntry = {
-  id: string;
-  question: string;
-  answer: string;
-  timestamp: number;
-};
-
 // Every "send" / "prefill" action rides the existing /api/chat endpoint —
 // no backend changes. "soon" items genuinely need backend work (auth,
-// storage, multi-doc comparison) and are shown disabled rather than faked.
+// storage, true cross-document search) and are shown disabled rather than
+// faked.
 const AI_ACTIONS: ActionItem[] = [
   { id: "ask", icon: "💬", label: "Ask / discuss document", kind: "focus" },
   {
@@ -182,37 +202,79 @@ type SpeechRecognitionLike = {
   stop: () => void;
 };
 
+function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(file);
+  });
+}
+
+function loadHistory(id: string): HistoryEntry[] {
+  try {
+    const stored = window.localStorage.getItem(`qm-history-${id}`);
+    return stored ? JSON.parse(stored) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(id: string, history: HistoryEntry[]) {
+  try {
+    window.localStorage.setItem(`qm-history-${id}`, JSON.stringify(history));
+  } catch {
+    // best-effort only
+  }
+}
+
+function makeId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export default function Home() {
   const [theme, setTheme] = useState<Theme>("dark");
 
-  const [file, setFile] = useState<File | null>(null);
-  const [documentId, setDocumentId] = useState("");
-  const [filename, setFilename] = useState("");
-  const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [documents, setDocuments] = useState<DocumentEntry[]>([]);
+  const [activeId, setActiveId] = useState("");
 
-  const [messages, setMessages] = useState<Message[]>([]);
   const [question, setQuestion] = useState("");
+  const [pendingTemplate, setPendingTemplate] = useState("");
 
-  const [uploading, setUploading] = useState(false);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [thinking, setThinking] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{
+    current: number;
+    total: number;
+  } | null>(null);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState("");
 
   const [listening, setListening] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(false);
 
-  const [fileUrl, setFileUrl] = useState("");
-
   const [actionCenterOpen, setActionCenterOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const chatMessagesRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const actionCenterRef = useRef<HTMLDivElement | null>(null);
+
+  const active = documents.find((d) => d.id === activeId) || null;
+  const messages = active?.messages ?? [];
+  const history = active?.history ?? [];
+  const analysis = active?.analysis ?? null;
+  const analyzing = active?.analyzing ?? false;
+  const thinking = active?.thinking ?? false;
+  const documentId = active?.id ?? "";
+  const filename = active?.filename ?? "";
+  const fileUrl = active?.url ?? "";
+
+  const busy = thinking || messages.some((m) => m.streaming);
+  const isUnfinishedTemplate =
+    pendingTemplate !== "" && question.trim() === pendingTemplate.trim();
 
   // ---- Theme ----
   useEffect(() => {
@@ -230,51 +292,30 @@ export default function Home() {
     });
   };
 
-  // ---- Keep a viewable URL for whichever file is currently selected ----
+  const updateDoc = (
+    id: string,
+    updater: (doc: DocumentEntry) => DocumentEntry
+  ) => {
+    setDocuments((docs) => docs.map((d) => (d.id === id ? updater(d) : d)));
+  };
+
+  // Revoke every object URL on unmount only — per-document URLs are
+  // revoked individually when that document is removed.
   useEffect(() => {
-    if (!file) {
-      setFileUrl("");
-      return;
-    }
-
-    const url = URL.createObjectURL(file);
-    setFileUrl(url);
-
-    return () => URL.revokeObjectURL(url);
-  }, [file]);
+    return () => {
+      documents.forEach((d) => URL.revokeObjectURL(d.url));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const viewDocument = () => {
     if (fileUrl) window.open(fileUrl, "_blank", "noopener,noreferrer");
   };
 
-  // ---- History: load per-document from localStorage, save on change ----
-  useEffect(() => {
-    if (!documentId) {
-      setHistory([]);
-      return;
-    }
-
-    try {
-      const stored = window.localStorage.getItem(`qm-history-${documentId}`);
-      setHistory(stored ? JSON.parse(stored) : []);
-    } catch {
-      setHistory([]);
-    }
-  }, [documentId]);
-
-  useEffect(() => {
-    if (!documentId) return;
-    window.localStorage.setItem(
-      `qm-history-${documentId}`,
-      JSON.stringify(history)
-    );
-  }, [history, documentId]);
-
   const clearHistory = () => {
-    setHistory([]);
-    if (documentId) {
-      window.localStorage.removeItem(`qm-history-${documentId}`);
-    }
+    if (!active) return;
+    updateDoc(active.id, (d) => ({ ...d, history: [] }));
+    saveHistory(active.id, []);
   };
 
   // ---- Close the action center when clicking outside it ----
@@ -371,46 +412,63 @@ export default function Home() {
     };
   }, []);
 
-  const selectFile = (selectedFile: File | null) => {
-    if (!selectedFile) return;
-
+  const validateFile = (candidate: File) => {
     const allowed = [
       "application/pdf",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "text/plain",
     ];
+    const validExtension = /\.(pdf|docx|txt)$/i.test(candidate.name);
+    return allowed.includes(candidate.type) || validExtension;
+  };
 
-    const validExtension = /\.(pdf|docx|txt)$/i.test(selectedFile.name);
+  const handleFilesSelected = async (fileList: FileList | File[]) => {
+    const incoming = Array.from(fileList);
+    const valid = incoming.filter(validateFile);
 
-    if (!allowed.includes(selectedFile.type) && !validExtension) {
-      setError("Please upload a PDF, DOCX, or TXT file.");
+    if (valid.length === 0) {
+      setError("Please upload PDF, DOCX, or TXT files.");
       return;
     }
 
     setError("");
-    setFile(selectedFile);
-    setAnalysis(null);
-    setMessages([]);
+    setUploadProgress({ current: 0, total: valid.length });
+
+    let lastUploadedId = "";
+
+    for (let i = 0; i < valid.length; i++) {
+      setUploadProgress({ current: i + 1, total: valid.length });
+      const newId = await uploadOne(valid[i]);
+      if (newId) lastUploadedId = newId;
+    }
+
+    setUploadProgress(null);
+
+    if (lastUploadedId) {
+      setActiveId(lastUploadedId);
+      setSidebarCollapsed(true);
+    }
   };
 
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    selectFile(e.target.files?.[0] || null);
+    if (e.target.files && e.target.files.length > 0) {
+      handleFilesSelected(e.target.files);
+    }
+    e.target.value = "";
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setDragging(false);
-    selectFile(e.dataTransfer.files?.[0] || null);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleFilesSelected(e.dataTransfer.files);
+    }
   };
 
-  const uploadDocument = async () => {
-    if (!file) return;
-
-    setUploading(true);
-    setError("");
-    setAnalysis(null);
-    setMessages([]);
-
+  // Uploads a single file through the existing /api/upload + /api/analyze
+  // endpoints (unchanged) and adds it as a new document entry. Returns the
+  // new document's id so the caller can decide which one to activate.
+  const uploadOne = async (file: File): Promise<string | null> => {
     try {
       const formData = new FormData();
       formData.append("file", file);
@@ -423,24 +481,38 @@ export default function Home() {
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.detail || "Upload failed.");
+        throw new Error(data.detail || `Upload failed for ${file.name}.`);
       }
 
-      setDocumentId(data.document_id);
-      setFilename(data.filename);
+      const id: string = data.document_id;
+      const isPlainText = /\.txt$/i.test(file.name) || file.type === "text/plain";
+      const editText = isPlainText ? await readFileAsText(file).catch(() => "") : "";
 
-      await analyzeDocument(data.document_id);
+      const entry: DocumentEntry = {
+        id,
+        file,
+        filename: data.filename || file.name,
+        url: URL.createObjectURL(file),
+        analysis: null,
+        analyzing: true,
+        thinking: false,
+        messages: [],
+        history: loadHistory(id),
+        editText,
+        editIsOriginal: isPlainText,
+      };
+
+      setDocuments((docs) => [...docs, entry]);
+      analyzeDocument(id);
+
+      return id;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Upload failed.");
-    } finally {
-      setUploading(false);
+      setError(err instanceof Error ? err.message : `Upload failed for ${file.name}.`);
+      return null;
     }
   };
 
   const analyzeDocument = async (id: string) => {
-    setAnalyzing(true);
-    setError("");
-
     try {
       const response = await fetch(`${API_URL}/api/analyze`, {
         method: "POST",
@@ -458,45 +530,45 @@ export default function Home() {
         throw new Error(data.detail || "Analysis failed.");
       }
 
-      setAnalysis(data);
+      updateDoc(id, (d) => ({ ...d, analysis: data, analyzing: false }));
     } catch (err) {
+      updateDoc(id, (d) => ({ ...d, analyzing: false }));
       setError(err instanceof Error ? err.message : "Analysis failed.");
-    } finally {
-      setAnalyzing(false);
     }
   };
 
-  // Reveals text word-by-word in the last message, purely on the client.
-  // Backend behavior (fetch + full JSON response) is unchanged.
-  const streamAssistantReply = (fullText: string) => {
+  // Reveals text word-by-word in the last message of the given document,
+  // purely on the client. Backend behavior (fetch + full JSON response)
+  // is unchanged.
+  const streamAssistantReply = (targetId: string, fullText: string) => {
     const words = fullText.split(" ");
     let i = 0;
 
-    setMessages((current) => [
-      ...current,
-      { role: "assistant", content: "", streaming: true },
-    ]);
+    updateDoc(targetId, (d) => ({
+      ...d,
+      messages: [...d.messages, { role: "assistant", content: "", streaming: true }],
+    }));
 
     if (streamTimerRef.current) clearInterval(streamTimerRef.current);
 
     streamTimerRef.current = setInterval(() => {
       i += 1;
+      const revealed = words.slice(0, i).join(" ");
+      const done = i >= words.length;
 
-      setMessages((current) => {
-        const updated = [...current];
+      updateDoc(targetId, (d) => {
+        const updated = [...d.messages];
         const lastIndex = updated.length - 1;
-        const revealed = words.slice(0, i).join(" ");
-
+        if (lastIndex < 0) return d;
         updated[lastIndex] = {
           role: "assistant",
           content: revealed,
-          streaming: i < words.length,
+          streaming: !done,
         };
-
-        return updated;
+        return { ...d, messages: updated };
       });
 
-      if (i >= words.length && streamTimerRef.current) {
+      if (done && streamTimerRef.current) {
         clearInterval(streamTimerRef.current);
         streamTimerRef.current = null;
       }
@@ -505,14 +577,16 @@ export default function Home() {
 
   const sendQuestion = async (rawQuestion: string) => {
     const userMessage = rawQuestion.trim();
-    if (!userMessage || !documentId || thinking) return;
+    const targetId = activeId;
+    const targetDoc = documents.find((d) => d.id === targetId);
+    if (!userMessage || !targetId || (targetDoc && targetDoc.thinking)) return;
 
     setQuestion("");
-    setMessages((current) => [
-      ...current,
-      { role: "user", content: userMessage },
-    ]);
-    setThinking(true);
+    updateDoc(targetId, (d) => ({
+      ...d,
+      messages: [...d.messages, { role: "user", content: userMessage }],
+      thinking: true,
+    }));
     setError("");
 
     try {
@@ -522,7 +596,7 @@ export default function Home() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          document_id: documentId,
+          document_id: targetId,
           message: userMessage,
         }),
       });
@@ -535,25 +609,26 @@ export default function Home() {
 
       const answerText = data.answer || "I couldn't generate an answer.";
 
-      setThinking(false);
-      streamAssistantReply(answerText);
+      updateDoc(targetId, (d) => {
+        const newHistory = [
+          ...d.history,
+          {
+            id: makeId(),
+            question: userMessage,
+            answer: answerText,
+            timestamp: Date.now(),
+          },
+        ];
+        saveHistory(targetId, newHistory);
+        return { ...d, thinking: false, history: newHistory };
+      });
 
-      setHistory((current) => [
-        ...current,
-        {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          question: userMessage,
-          answer: answerText,
-          timestamp: Date.now(),
-        },
-      ]);
+      streamAssistantReply(targetId, answerText);
     } catch (err) {
-      setThinking(false);
+      updateDoc(targetId, (d) => ({ ...d, thinking: false }));
       setError(err instanceof Error ? err.message : "Chat request failed.");
     }
   };
-
-  const [pendingTemplate, setPendingTemplate] = useState("");
 
   const askQuestion = () => {
     if (isUnfinishedTemplate) return;
@@ -595,20 +670,74 @@ export default function Home() {
     }
   };
 
-  const resetDocument = () => {
-    setFile(null);
-    setDocumentId("");
-    setFilename("");
-    setAnalysis(null);
-    setMessages([]);
+  const removeDocument = (id: string) => {
+    const doc = documents.find((d) => d.id === id);
+    if (doc) URL.revokeObjectURL(doc.url);
+
+    setDocuments((docs) => docs.filter((d) => d.id !== id));
+
+    if (activeId === id) {
+      const remaining = documents.filter((d) => d.id !== id);
+      setActiveId(remaining.length > 0 ? remaining[remaining.length - 1].id : "");
+    }
+
     setQuestion("");
-    setError("");
     setPendingTemplate("");
+    setError("");
   };
 
-  const busy = thinking || messages.some((m) => m.streaming);
-  const isUnfinishedTemplate =
-    pendingTemplate !== "" && question.trim() === pendingTemplate.trim();
+  const clearAllDocuments = () => {
+    documents.forEach((d) => URL.revokeObjectURL(d.url));
+    setDocuments([]);
+    setActiveId("");
+    setQuestion("");
+    setPendingTemplate("");
+    setError("");
+    setSidebarCollapsed(false);
+  };
+
+  // ---- Live edit + export (client-only, no backend involved) ----
+  const updateEditText = (text: string) => {
+    if (!active) return;
+    updateDoc(active.id, (d) => ({ ...d, editText: text }));
+  };
+
+  const insertLatestReply = () => {
+    if (!active) return;
+    const lastAssistant = [...active.messages]
+      .reverse()
+      .find((m) => m.role === "assistant" && !m.streaming);
+    if (lastAssistant) {
+      updateDoc(active.id, (d) => ({ ...d, editText: lastAssistant.content }));
+    }
+  };
+
+  const resetEditText = async () => {
+    if (!active) return;
+    if (active.editIsOriginal) {
+      const text = await readFileAsText(active.file).catch(() => "");
+      updateDoc(active.id, (d) => ({ ...d, editText: text }));
+    } else {
+      updateDoc(active.id, (d) => ({ ...d, editText: "" }));
+    }
+  };
+
+  const downloadEditedDocument = () => {
+    if (!active) return;
+
+    const base = active.filename.replace(/\.[^./\\]+$/, "");
+    const blob = new Blob([active.editText], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${base}-edited.txt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <div className="app-shell" data-theme={theme}>
@@ -693,12 +822,70 @@ export default function Home() {
       {error && <div className="error-banner">{error}</div>}
 
       <div className="workspace">
-        <aside className="sidebar">
-          <div className="eyebrow">DOCUMENT</div>
+        <aside className={`sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
+          <button
+            type="button"
+            className="sidebar-toggle"
+            onClick={() => setSidebarCollapsed((v) => !v)}
+            aria-expanded={!sidebarCollapsed}
+          >
+            <span>
+              {documents.length > 0
+                ? `${documents.length} document${documents.length > 1 ? "s" : ""}`
+                : "Documents & analysis"}
+            </span>
+            <span className={`chevron ${sidebarCollapsed ? "" : "open"}`}>
+              ⌄
+            </span>
+          </button>
 
-          {!documentId ? (
+          <div className="sidebar-body">
+            <div className="section-heading">
+              <div className="eyebrow">DOCUMENTS</div>
+              {documents.length > 0 && (
+                <button type="button" className="ghost-button small" onClick={clearAllDocuments}>
+                  Clear all
+                </button>
+              )}
+            </div>
+
+            {documents.length > 0 && (
+              <div className="doc-list">
+                {documents.map((doc) => (
+                  <button
+                    type="button"
+                    key={doc.id}
+                    className={`doc-list-item ${doc.id === activeId ? "active" : ""}`}
+                    onClick={() => setActiveId(doc.id)}
+                  >
+                    <span className="doc-list-icon">📄</span>
+                    <span className="doc-list-name">{doc.filename}</span>
+                    {doc.analyzing && <span className="doc-list-spinner" />}
+                    <span
+                      className="doc-list-remove"
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`Remove ${doc.filename}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeDocument(doc.id);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.stopPropagation();
+                          removeDocument(doc.id);
+                        }
+                      }}
+                    >
+                      ✕
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+
             <div
-              className={`upload-card ${dragging ? "dragging" : ""}`}
+              className={`upload-card ${documents.length > 0 ? "compact" : ""} ${dragging ? "dragging" : ""}`}
               onDragOver={(e) => {
                 e.preventDefault();
                 setDragging(true);
@@ -706,188 +893,205 @@ export default function Home() {
               onDragLeave={() => setDragging(false)}
               onDrop={handleDrop}
             >
-              <div className="upload-icon">↑</div>
-
-              <h2>Drop your document</h2>
-
-              <p>or choose a file from your computer</p>
+              {documents.length === 0 && (
+                <>
+                  <div className="upload-icon">↑</div>
+                  <h2>Drop your documents</h2>
+                  <p>or choose files from your computer</p>
+                </>
+              )}
 
               <label className="browse-button">
-                Browse files
+                {documents.length > 0 ? "+ Add documents" : "Browse files"}
                 <input
                   type="file"
                   accept=".pdf,.docx,.txt"
+                  multiple
                   onChange={handleFileChange}
                   hidden
                 />
               </label>
 
-              <div className="supported">
-                PDF <span>•</span> DOCX <span>•</span> TXT
-              </div>
+              {documents.length === 0 && (
+                <div className="supported">
+                  PDF <span>•</span> DOCX <span>•</span> TXT <span>•</span> multiple at once
+                </div>
+              )}
 
-              {file && (
-                <div className="selected-file">
-                  <div className="selected-file-info">
-                    <strong>{file.name}</strong>
-                    <small>{formatBytes(file.size)}</small>
-                  </div>
-
-                  <div className="selected-file-actions">
-                    <button
-                      type="button"
-                      className="ghost-button"
-                      onClick={viewDocument}
-                      disabled={!fileUrl}
-                    >
-                      View document
-                    </button>
-
-                    <button onClick={uploadDocument} disabled={uploading}>
-                      {uploading ? "Uploading..." : "Analyze document"}
-                    </button>
-                  </div>
+              {uploadProgress && (
+                <div className="upload-progress">
+                  Uploading {uploadProgress.current} of {uploadProgress.total}...
                 </div>
               )}
             </div>
-          ) : (
-            <div className="document-card">
-              <div className="document-icon">PDF</div>
 
-              <div className="document-info">
-                <strong>{filename}</strong>
-                <span>
-                  {analysis
-                    ? `${analysis.word_count.toLocaleString()} words`
-                    : "Processing document..."}
-                </span>
+            {active && (
+              <div className="document-card">
+                <div className="document-icon">PDF</div>
+
+                <div className="document-info">
+                  <strong>{filename}</strong>
+                  <span>
+                    {analysis
+                      ? `${analysis.word_count.toLocaleString()} words`
+                      : analyzing
+                        ? "Processing document..."
+                        : "Ready"}
+                  </span>
+                </div>
+
+                <div className="document-card-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={viewDocument}
+                    disabled={!fileUrl}
+                  >
+                    View
+                  </button>
+
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setEditorOpen(true)}
+                  >
+                    Edit
+                  </button>
+
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => removeDocument(active.id)}
+                  >
+                    Remove
+                  </button>
+                </div>
               </div>
+            )}
 
-              <div className="document-card-actions">
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={viewDocument}
-                  disabled={!fileUrl}
-                >
-                  View document
-                </button>
+            {active && (analyzing || analysis) && (
+              <div className="dashboard-block">
+                <div className="section-heading">
+                  <div className="eyebrow">ANALYSIS</div>
 
-                <button className="secondary-button" onClick={resetDocument}>
-                  New document
-                </button>
-              </div>
-            </div>
-          )}
+                  {analyzing && (
+                    <div className="processing">
+                      <span className="spinner" />
+                      Analyzing...
+                    </div>
+                  )}
+                </div>
 
-          {(analyzing || analysis) && (
-            <div className="dashboard-block">
-              <div className="section-heading">
-                <div className="eyebrow">ANALYSIS</div>
+                {analysis && (
+                  <>
+                    <div className="stats-grid">
+                      <div className="stat-card primary-stat">
+                        <div className="stat-label">AI likelihood</div>
 
-                {analyzing && (
-                  <div className="processing">
-                    <span className="spinner" />
-                    Analyzing...
-                  </div>
+                        <div className="score-row">
+                          <div className="big-score">
+                            {analysis.overall_ai_likelihood}%
+                          </div>
+
+                          <div
+                            className={`confidence ${analysis.confidence.toLowerCase()}`}
+                          >
+                            {analysis.confidence}
+                          </div>
+                        </div>
+
+                        <div className="progress-track">
+                          <div
+                            className="progress-value"
+                            style={{
+                              width: `${analysis.overall_ai_likelihood}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="stat-card">
+                        <div className="stat-label">Word count</div>
+                        <div className="stat-number">
+                          {analysis.word_count.toLocaleString()}
+                        </div>
+                      </div>
+
+                      <div className="stat-card">
+                        <div className="stat-label">Sections analyzed</div>
+                        <div className="stat-number">
+                          {analysis.sections.length}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="analysis-card">
+                      <div className="card-header">
+                        <h3>AI likelihood by section</h3>
+                        <p>Statistical text signals, not proof of authorship.</p>
+                      </div>
+
+                      <div className="section-list">
+                        {analysis.sections.map((section) => (
+                          <div className="section-row" key={section.chunk_index}>
+                            <div className="section-meta">
+                              <span>Section {section.chunk_index + 1}</span>
+                              <small>Page {section.page}</small>
+                            </div>
+
+                            <div className="section-bar">
+                              <div
+                                className="section-bar-value"
+                                style={{
+                                  width: `${section.score ?? 0}%`,
+                                }}
+                              />
+                            </div>
+
+                            <div className="section-score">
+                              {section.score !== null
+                                ? `${section.score}%`
+                                : "N/A"}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="analysis-note">
+                        <span>i</span>
+                        {analysis.note}
+                      </div>
+                    </div>
+                  </>
                 )}
               </div>
-
-              {analysis && (
-                <>
-                  <div className="stats-grid">
-                    <div className="stat-card primary-stat">
-                      <div className="stat-label">AI likelihood</div>
-
-                      <div className="score-row">
-                        <div className="big-score">
-                          {analysis.overall_ai_likelihood}%
-                        </div>
-
-                        <div
-                          className={`confidence ${analysis.confidence.toLowerCase()}`}
-                        >
-                          {analysis.confidence}
-                        </div>
-                      </div>
-
-                      <div className="progress-track">
-                        <div
-                          className="progress-value"
-                          style={{
-                            width: `${analysis.overall_ai_likelihood}%`,
-                          }}
-                        />
-                      </div>
-                    </div>
-
-                    <div className="stat-card">
-                      <div className="stat-label">Word count</div>
-                      <div className="stat-number">
-                        {analysis.word_count.toLocaleString()}
-                      </div>
-                    </div>
-
-                    <div className="stat-card">
-                      <div className="stat-label">Sections analyzed</div>
-                      <div className="stat-number">
-                        {analysis.sections.length}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="analysis-card">
-                    <div className="card-header">
-                      <h3>AI likelihood by section</h3>
-                      <p>Statistical text signals, not proof of authorship.</p>
-                    </div>
-
-                    <div className="section-list">
-                      {analysis.sections.map((section) => (
-                        <div className="section-row" key={section.chunk_index}>
-                          <div className="section-meta">
-                            <span>Section {section.chunk_index + 1}</span>
-                            <small>Page {section.page}</small>
-                          </div>
-
-                          <div className="section-bar">
-                            <div
-                              className="section-bar-value"
-                              style={{
-                                width: `${section.score ?? 0}%`,
-                              }}
-                            />
-                          </div>
-
-                          <div className="section-score">
-                            {section.score !== null
-                              ? `${section.score}%`
-                              : "N/A"}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="analysis-note">
-                      <span>i</span>
-                      {analysis.note}
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
-          )}
+            )}
+          </div>
         </aside>
 
         <section className="chat-panel">
           <div className="chat-panel-header">
             <div className="eyebrow">RAG ASSISTANT</div>
-            <h2>Chat with your document</h2>
+            <h2>{active ? `Chat — ${filename}` : "Chat with your document"}</h2>
           </div>
 
           <div className="chat-card">
             <div className="chat-messages" ref={chatMessagesRef}>
-              {messages.length === 0 ? (
+              {!active ? (
+                <div className="empty-chat">
+                  <div className="chat-orb">
+                    <img src="/logo.png" alt="" />
+                  </div>
+
+                  <h3>Upload a document to get started</h3>
+
+                  <p>
+                    You can add more than one — each keeps its own chat,
+                    analysis, and edit draft. Switch between them any time
+                    from the list on the left.
+                  </p>
+                </div>
+              ) : messages.length === 0 ? (
                 <div className="empty-chat">
                   <div className="chat-orb">
                     <img src="/logo.png" alt="" />
@@ -965,7 +1169,9 @@ export default function Home() {
                 placeholder={
                   listening
                     ? "Listening..."
-                    : "Ask a question about your document..."
+                    : documentId
+                      ? "Ask a question about your document..."
+                      : "Upload a document to start chatting..."
                 }
                 rows={1}
                 disabled={!documentId}
@@ -980,7 +1186,27 @@ export default function Home() {
                   aria-label={listening ? "Stop voice input" : "Ask by voice"}
                   title={listening ? "Stop voice input" : "Ask by voice"}
                 >
-                  🎙
+                  {listening ? (
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor" />
+                      <path
+                        d="M5 11a7 7 0 0 0 14 0"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                      />
+                      <path
+                        d="M12 18v3"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                      />
+                    </svg>
+                  )}
                 </button>
               )}
 
@@ -995,8 +1221,17 @@ export default function Home() {
                     ? "Finish the sentence before sending"
                     : undefined
                 }
+                aria-label="Send message"
               >
-                ↑
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path
+                    d="M12 19V5M12 5l-6 6M12 5l6 6"
+                    stroke="currentColor"
+                    strokeWidth="2.3"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
               </button>
             </div>
 
@@ -1015,7 +1250,7 @@ export default function Home() {
         <div className="history-overlay" onClick={() => setHistoryOpen(false)}>
           <div className="history-panel" onClick={(e) => e.stopPropagation()}>
             <div className="history-panel-header">
-              <h3>History</h3>
+              <h3>History{active ? ` — ${filename}` : ""}</h3>
               <div className="history-panel-actions">
                 {history.length > 0 && (
                   <button className="ghost-button" onClick={clearHistory}>
@@ -1033,7 +1268,9 @@ export default function Home() {
               </div>
             </div>
 
-            {history.length === 0 ? (
+            {!active ? (
+              <p className="history-empty">Upload and select a document first.</p>
+            ) : history.length === 0 ? (
               <p className="history-empty">
                 Questions you ask about this document will show up here.
               </p>
@@ -1067,17 +1304,83 @@ export default function Home() {
           </div>
         </div>
       )}
+
+      {editorOpen && active && (
+        <div className="history-overlay" onClick={() => setEditorOpen(false)}>
+          <div
+            className="history-panel editor-panel"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="history-panel-header">
+              <h3>Edit — {filename}</h3>
+              <div className="history-panel-actions">
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={() => setEditorOpen(false)}
+                  aria-label="Close editor"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            {!active.editIsOriginal && (
+              <div className="editor-note">
+                QuantumMines can only read the original text straight from
+                <strong> .txt</strong> files here — this document is a PDF or
+                DOCX, so this starts as a blank draft rather than its real
+                content. Use an Action Center item like Summary or Rewrite to
+                generate a starting point, then pull it in below, or just
+                write your own notes.
+              </div>
+            )}
+
+            <div className="editor-toolbar">
+              <button
+                type="button"
+                className="ghost-button small"
+                onClick={insertLatestReply}
+                disabled={!messages.some((m) => m.role === "assistant" && !m.streaming)}
+              >
+                Insert latest AI reply
+              </button>
+
+              <button type="button" className="ghost-button small" onClick={resetEditText}>
+                Reset
+              </button>
+            </div>
+
+            <textarea
+              className="editor-textarea"
+              value={active.editText}
+              onChange={(e) => updateEditText(e.target.value)}
+              placeholder={
+                active.editIsOriginal
+                  ? "Original document text — edit freely."
+                  : "Start writing, or use the buttons above to pull in AI-generated content..."
+              }
+            />
+
+            <div className="editor-actions">
+              <span className="editor-hint">
+                Downloads as a new .txt file — the original {filename} is
+                never overwritten.
+              </span>
+              <button
+                type="button"
+                className="browse-button"
+                onClick={downloadEditedDocument}
+                disabled={!active.editText.trim()}
+              >
+                Download edited .txt
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
-}
-
-function formatBytes(bytes: number) {
-  if (bytes === 0) return "0 Bytes";
-
-  const units = ["Bytes", "KB", "MB", "GB"];
-  const index = Math.floor(Math.log(bytes) / Math.log(1024));
-
-  return `${(bytes / Math.pow(1024, index)).toFixed(1)} ${units[index]}`;
 }
 
 function formatTime(timestamp: number) {
